@@ -23,6 +23,10 @@ def load_config() -> dict:
             for key in DEFAULT_CONFIG:
                 if key in data:
                     cfg[key] = data[key]
+            # keep keys owned by other components (e.g. app ui settings)
+            for key, value in data.items():
+                if key not in cfg:
+                    cfg[key] = value
     except (OSError, ValueError):
         pass
     if not isinstance(cfg.get("port"), int) or not (1 <= cfg["port"] <= 65535):
@@ -32,7 +36,16 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     try:
+        merged = {}
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                merged = data
+        except (OSError, ValueError):
+            pass
+        merged.update(cfg)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(merged, f, ensure_ascii=False, indent=2)
     except OSError:
         pass

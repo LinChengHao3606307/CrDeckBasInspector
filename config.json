@@ -1,6 +1,7 @@
 {
   "port": 8765,
   "last_url": "",
-  "pointer_pos": true,
-  "pointer_trail": false
+  "pointer_pos": false,
+  "pointer_trail": false,
+  "direct_lookup": true
 }

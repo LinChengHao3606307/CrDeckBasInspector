@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -394,10 +395,10 @@ class CrDeckInspectorApp:
         )
         self.service_status.pack(anchor="w", pady=(6, 0), **pad)
 
-        self.direct_lookup_var = tk.BooleanVar(value=False)
+        self.direct_lookup_var = tk.BooleanVar(value=self._load_direct_lookup())
         tk.Checkbutton(
             side, text="Token \u76f4\u67e5\uff08\u4e0d\u6a21\u62df\u4eba\u5de5\uff09",
-            variable=self.direct_lookup_var, bg=PANEL, fg=MUTED,
+            variable=self.direct_lookup_var, command=self._save_direct_lookup, bg=PANEL, fg=MUTED,
             activebackground=PANEL, activeforeground=FG, selectcolor=PANEL_2,
             highlightthickness=0, bd=0, font=(FONT, 9),
         ).pack(anchor="w", pady=(6, 0), **pad)
@@ -574,6 +575,25 @@ class CrDeckInspectorApp:
 
     def _mark_url_dirty(self) -> None:
         self._url_dirty = True
+
+    def _load_direct_lookup(self) -> bool:
+        try:
+            cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+            return bool(cfg.get("direct_lookup", True))
+        except Exception:
+            return True
+
+    def _save_direct_lookup(self) -> None:
+        try:
+            path = ROOT / "config.json"
+            try:
+                cfg = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                cfg = {}
+            cfg["direct_lookup"] = bool(self.direct_lookup_var.get())
+            path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _set_pointer_flag(self, flag: str, var: tk.BooleanVar) -> None:
         value = "on" if var.get() else "off"
@@ -1112,6 +1132,7 @@ class CrDeckInspectorApp:
                     query["clan"] = clan
             if direct:
                 query["human"] = "0"
+                query["direct"] = "1"
             url = "http://127.0.0.1:%s/royaleapi/deck/?%s" % (
                 port,
                 urllib.parse.urlencode(query),
@@ -1123,8 +1144,17 @@ class CrDeckInspectorApp:
                 if not direct
                 else ("[deck] %s direct lookup: %s" % (mode, label), "info")
             )
-            with urllib.request.urlopen(url, timeout=180) as response:
-                payload = json.loads(response.read().decode("utf-8", "replace"))
+            try:
+                with urllib.request.urlopen(url, timeout=180) as response:
+                    body = response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")
+                try:
+                    detail = json.loads(body).get("error") or body
+                except ValueError:
+                    detail = body
+                raise RuntimeError("API %s: %s" % (exc.code, detail)) from None
+            payload = json.loads(body)
             if not payload.get("ok", True):
                 raise RuntimeError(payload.get("error") or "deck lookup failed")
             deck = payload.get("deck") or []
