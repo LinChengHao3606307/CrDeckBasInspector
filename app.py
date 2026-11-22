@@ -21,9 +21,11 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.parse
+import urllib.request
 import webbrowser
 from pathlib import Path
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import cv2
 import numpy as np
@@ -166,12 +168,27 @@ class CrDeckInspectorApp:
         self._server_running = False
         self._sash_placed = False
         self._url_dirty = False
+        self._annotating = False
+        self._annotate_events: queue.Queue[tuple[str, str, str]] = queue.Queue()
+
+        # Live battle OCR: sample the live frames and look up the opponent deck
+        # in the embedded browser once per battle.
+        self._battle_active = False
+        self._battle_hits = 0
+        self._idle_hits = 0
+        self._ocr_frame_lock = threading.Lock()
+        self._ocr_frame: np.ndarray | None = None
+        self._ocr_wake = threading.Event()
+        self._ocr_events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._last_ocr_at = 0.0
+        self._lookup_busy = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(15, self._pump)
         self.root.after(100, self._boot_async)
         self.root.after(400, self._start_browser)
+        threading.Thread(target=self._ocr_loop, daemon=True).start()
 
     # ---------------- UI ----------------
 
@@ -278,6 +295,10 @@ class CrDeckInspectorApp:
         self._make_button(actions, "Restart Receiver", self._restart_server).pack(
             side=tk.LEFT, padx=(8, 0)
         )
+        self.annotate_button = self._make_button(
+            actions, "视频标注", self._pick_videos_for_annotation
+        )
+        self.annotate_button.pack(side=tk.LEFT, padx=(8, 0))
 
         self.firewall_label = tk.Label(actions, text="", bg=PANEL, fg=YELLOW, font=(FONT, 9))
         self.firewall_label.pack(side=tk.RIGHT)
@@ -372,6 +393,14 @@ class CrDeckInspectorApp:
             side, text="\u25cf not started", bg=PANEL, fg=MUTED, font=(FONT, 9)
         )
         self.service_status.pack(anchor="w", pady=(6, 0), **pad)
+
+        self.direct_lookup_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            side, text="Token \u76f4\u67e5\uff08\u4e0d\u6a21\u62df\u4eba\u5de5\uff09",
+            variable=self.direct_lookup_var, bg=PANEL, fg=MUTED,
+            activebackground=PANEL, activeforeground=FG, selectcolor=PANEL_2,
+            highlightthickness=0, bd=0, font=(FONT, 9),
+        ).pack(anchor="w", pady=(6, 0), **pad)
 
         tk.Frame(side, bg=PANEL_2, height=1).pack(fill=tk.X, pady=(14, 0), **pad)
 
@@ -730,6 +759,7 @@ class CrDeckInspectorApp:
                 continue
 
             self._push_frame(frame)
+            self._offer_ocr_frame(frame)
 
     def _push_frame(self, frame: np.ndarray) -> None:
         if self.frames.full():
@@ -785,6 +815,8 @@ class CrDeckInspectorApp:
             self._apply_status('Receiver stopped, click "Restart Receiver"', "error")
 
         self._drain_browser_events()
+        self._drain_annotation_events()
+        self._drain_ocr_events()
         self.root.after(15, self._pump)
 
     def _apply_status(self, text: str, kind: str) -> None:
@@ -907,6 +939,212 @@ class CrDeckInspectorApp:
         paths = active_paths(timeout=1.0)
         path = paths[0] if paths else "live/" + DEFAULT_STREAM_KEY
         webbrowser.open(f"http://127.0.0.1:{WEBRTC_PORT}/{path}")
+
+    def _pick_videos_for_annotation(self) -> None:
+        paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="选择要标注的对战视频",
+            filetypes=[("MP4 video", "*.mp4"), ("All files", "*.*")],
+        )
+        if not paths:
+            return
+        if self._annotating:
+            self._append_log("[annotate] a job is already running", "info")
+            return
+        self._annotating = True
+        self.annotate_button.configure(state=tk.DISABLED)
+        self._append_log(
+            "[annotate] queued %d video(s), output -> %s" % (len(paths), ROOT), "info"
+        )
+        threading.Thread(
+            target=self._annotate_worker, args=(list(paths),), daemon=True
+        ).start()
+
+    def _annotate_worker(self, paths: list[str]) -> None:
+        def emit(line: str, tag: str = "info") -> None:
+            self._annotate_events.put(("line", line, tag))
+
+        try:
+            import battle_annotator
+
+            battle_annotator.annotate_videos(
+                paths, out_dir=ROOT, log=emit
+            )
+        except Exception as exc:
+            emit("[annotate] failed: %s" % (exc,), "err")
+        else:
+            emit("[annotate] all videos finished", "resp")
+        finally:
+            self._annotate_events.put(("done", "", ""))
+
+    def _drain_annotation_events(self) -> None:
+        while True:
+            try:
+                kind, text, tag = self._annotate_events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "done":
+                self._annotating = False
+                self.annotate_button.configure(state=tk.NORMAL)
+                continue
+            self._append_log(text, tag)
+
+    # ---------------- Live battle OCR ----------------
+
+    def _offer_ocr_frame(self, frame: np.ndarray) -> None:
+        # Called from the viewer thread; keep at most one frame per second.
+        now = time.time()
+        if now - self._last_ocr_at < 1.0:
+            return
+        self._last_ocr_at = now
+        with self._ocr_frame_lock:
+            self._ocr_frame = frame.copy()
+        self._ocr_wake.set()
+
+    def _ocr_loop(self) -> None:
+        recognizer = None
+        while not self.stop_event.is_set():
+            self._ocr_wake.wait(timeout=0.5)
+            self._ocr_wake.clear()
+            with self._ocr_frame_lock:
+                frame = self._ocr_frame
+                self._ocr_frame = None
+            if frame is None:
+                continue
+            try:
+                if recognizer is None:
+                    from battle_annotator import BattleRecognizer
+
+                    recognizer = BattleRecognizer(log=lambda _line: None)
+                result = recognizer.detect(frame)
+            except Exception as exc:
+                self._ocr_events.put(("[ocr] recognition failed: %r" % (exc,), "err"))
+                time.sleep(1.0)
+                continue
+            self._update_battle_state(result)
+
+    def _update_battle_state(self, result: dict) -> None:
+        if result.get("battle"):
+            self._battle_hits += 1
+            self._idle_hits = 0
+        else:
+            self._idle_hits += 1
+            self._battle_hits = 0
+
+        if not self._battle_active and self._battle_hits >= 2:
+            self._battle_active = True
+            name = ((result.get("name") or {}).get("text") or "").strip()
+            clan = ((result.get("clan") or {}).get("text") or "").strip()
+            self._ocr_events.put(
+                ("[battle] opponent: %s / %s" % (name or "?", clan or "-"), "resp")
+            )
+            if name:
+                self._start_deck_lookup(name, clan)
+            else:
+                self._ocr_events.put(
+                    ("[battle] opponent name not recognised, deck lookup skipped", "err")
+                )
+        elif self._battle_active and self._idle_hits >= 2:
+            self._battle_active = False
+            self._ocr_events.put(("[battle] finished", "info"))
+
+    @staticmethod
+    def _player_tag(text: str) -> str:
+        value = (text or "").strip().upper().replace(" ", "")
+        has_hash = value.startswith("#")
+        if has_hash:
+            value = value[1:]
+        if not 3 <= len(value) <= 12:
+            return ""
+        if not set(value) <= set("0289PYLQGRJCUV"):
+            return ""
+        # Without "#" a short string is more likely an OCR name than a tag.
+        if not has_hash and len(value) < 6:
+            return ""
+        return "#" + value
+
+    @staticmethod
+    def _usable_clan(clan: str) -> str:
+        value = (clan or "").strip()
+        if value in {"", "无部落", "無部落", "无", "無", "-"}:
+            return ""
+        return value
+
+    def _start_deck_lookup(self, name: str, clan: str) -> None:
+        if self._lookup_busy:
+            return
+        self._lookup_busy = True
+        threading.Thread(
+            target=self._lookup_deck_worker,
+            args=(name, self._usable_clan(clan)),
+            daemon=True,
+        ).start()
+
+    def _ensure_browser_service(self, port: str) -> None:
+        if self._server_running:
+            return
+        self._browser_send("SERVER START " + port)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(
+                    "http://127.0.0.1:%s/health" % port, timeout=1
+                ):
+                    return
+            except Exception:
+                time.sleep(0.5)
+        raise RuntimeError("browser API did not start on port %s" % port)
+
+    def _lookup_deck_worker(self, name: str, clan: str) -> None:
+        try:
+            port = self.port_var.get().strip() or "8765"
+            self._ensure_browser_service(port)
+            direct = bool(
+                getattr(self, "direct_lookup_var", None) and self.direct_lookup_var.get()
+            )
+            tag = self._player_tag(name)
+            query = {}
+            if tag:
+                query["tag"] = tag
+            else:
+                query["name"] = name
+                if clan:
+                    query["clan"] = clan
+            if direct:
+                query["human"] = "0"
+            url = "http://127.0.0.1:%s/royaleapi/deck/?%s" % (
+                port,
+                urllib.parse.urlencode(query),
+            )
+            label = tag or (name if not clan else "%s / %s" % (name, clan))
+            mode = "tag" if tag else "name"
+            self._ocr_events.put(
+                ("[deck] %s lookup: %s" % (mode, label), "info")
+                if not direct
+                else ("[deck] %s direct lookup: %s" % (mode, label), "info")
+            )
+            with urllib.request.urlopen(url, timeout=180) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+            if not payload.get("ok", True):
+                raise RuntimeError(payload.get("error") or "deck lookup failed")
+            deck = payload.get("deck") or []
+            if isinstance(deck, list) and deck and isinstance(deck[0], dict):
+                cards = ", ".join(str(card.get("name", "")) for card in deck)
+            else:
+                cards = str(deck)
+            self._ocr_events.put(("[deck] %s" % (cards or "no deck"), "resp"))
+        except Exception as exc:
+            self._ocr_events.put(("[deck] %s" % (exc,), "err"))
+        finally:
+            self._lookup_busy = False
+
+    def _drain_ocr_events(self) -> None:
+        while True:
+            try:
+                text, tag = self._ocr_events.get_nowait()
+            except queue.Empty:
+                return
+            self._append_log(text, tag)
 
     def _restart_server(self) -> None:
         def work() -> None:

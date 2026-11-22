@@ -1,4 +1,4 @@
-# Python cache
+﻿# Python cache
 __pycache__/
 *.py[cod]
 
@@ -12,3 +12,8 @@ tools/
 # Embedded browser runtime data (Chromium profile, recordings)
 profile/
 recordings/
+
+# Battle video annotator outputs
+annotated/
+results/
+source_videos/
