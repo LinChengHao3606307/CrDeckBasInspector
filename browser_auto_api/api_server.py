@@ -292,12 +292,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     not in ("0", "false", "no", "off")
                 human = (query.get("human") or ["1"])[0].strip().lower() \
                     not in ("0", "false", "no", "off")
+                direct = (query.get("direct") or ["0"])[0].strip().lower() \
+                    not in ("0", "false", "no", "off")
                 try:
                     result = royaleapi.deck_by_name(
                         self.server_api.backend,
                         name or "#" + tag.lstrip("#"),
                         clan=clan, index=index, max_candidates=max_candidates,
-                        wait=wait, solve=solve, attempts=attempts, human=human)
+                        wait=wait, solve=solve, attempts=attempts, human=human,
+                        direct=direct)
                 except ValueError as exc:
                     self._send_json(400, {"ok": False, "error": str(exc)})
                     return

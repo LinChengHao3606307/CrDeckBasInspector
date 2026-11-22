@@ -126,6 +126,22 @@ def _clan_match(want, got_name, got_tag):
     return bool(g) and (w == g or w in g or g in w)
 
 
+def _pick_result(candidates, query, clan, index, max_candidates):
+    """选择要打开的搜索结果下标。
+
+    给了 clan 时后面会逐条核对，从头扫即可；未给 clan 时优先找名字精确
+    匹配（忽略大小写）：RoyaleAPI 按奖杯数排序，短名 "Utto" 会排在
+    "UTTORIKKU" 这类长名后面，盲取第一条容易选错人。
+    """
+    if clan:
+        return 0
+    wanted = _norm(query)
+    for pos, cand in enumerate(candidates[:max_candidates]):
+        if _norm(cand.get("name")) == wanted:
+            return pos
+    return min(index, len(candidates) - 1)
+
+
 def _search_ready(d):
     return (bool(d.get("results")) or
             _challenge(d.get("title", ""), d.get("text", "")) or
@@ -193,6 +209,113 @@ def _open(backend, url, expr, ready, wait, solve, attempts):
             if isinstance(data, dict) and not data.get("error") and \
                     expect not in str(data.get("url", "")):
                 data = {"error": "页面未加载到目标地址", "url": data.get("url", "")}
+    return data, solved
+
+
+SEARCH_FETCH_START = """
+(function(){
+  window.__crSearchHTML = 'PENDING';
+  fetch(%s, {credentials: 'include'})
+    .then(function(r){ return r.text(); })
+    .then(function(t){ window.__crSearchHTML = String(t); })
+    .catch(function(e){ window.__crSearchHTML = 'FETCH_ERROR:' + e; });
+  return JSON.stringify({started: true});
+})()
+"""
+
+# Token-direct search: the query is sent as a same-origin fetch (it carries the
+# Cloudflare cookies), the HTML fragment is parsed offscreen with DOMParser and
+# only the candidate list is returned. The visible page is never navigated.
+SEARCH_FETCH_POLL = """
+(function(){
+  var html = window.__crSearchHTML;
+  if (typeof html === 'undefined' || html === null || html === 'PENDING') {
+    return JSON.stringify({state: 'pending'});
+  }
+  if (String(html).indexOf('FETCH_ERROR:') === 0) {
+    return JSON.stringify({state: 'error', error: String(html)});
+  }
+  var doc = new DOMParser().parseFromString(String(html), 'text/html');
+  var out = [];
+  doc.querySelectorAll('.player_search_results__result_container').forEach(function(el){
+    var a = el.querySelector('a.header');
+    var t = el.querySelector('.player_tag');
+    var href = a ? a.getAttribute('href') : '';
+    var tag = t ? t.textContent.trim() : '';
+    out.push({
+      name: a ? a.textContent.replace(/\\s+/g, ' ').trim() : '',
+      href: href,
+      tag: tag
+    });
+  });
+  var raw = String(html);
+  return JSON.stringify({
+    state: 'done',
+    title: doc.title || '',
+    count: out.length,
+    results: out.slice(0, 20),
+    text: (doc.body ? doc.body.innerText : '').slice(0, 400),
+    markers: {
+      raw_len: raw.length,
+      container_hits: (raw.match(/result_container/g) || []).length,
+      next_data: raw.indexOf('__NEXT_DATA__') >= 0,
+      preloaded: raw.indexOf('__PRELOADED') >= 0,
+      cloudflare: raw.indexOf('cf-chl') >= 0 || raw.indexOf('Just a moment') >= 0
+    }
+  });
+})()
+"""
+
+
+def _fetch_ready(d):
+    state = d.get("state")
+    if state == "pending":
+        return False
+    if state in ("error", "done"):
+        if state == "done" and not d.get("results"):
+            # Terminal only when the fragment clearly says no players;
+            # otherwise keep polling in case the fragment is still parsing.
+            return ("no player" in str(d.get("text", "")).lower()
+                    or "没有" in str(d.get("text", "")))
+        return True
+    return False
+
+
+def _ensure_origin(backend, wait, solve, attempts):
+    """Direct fetch needs a same-origin page; open the site once if needed."""
+    data = _poll(backend, URL_JS,
+                 lambda d: "royaleapi.com" in str(d.get("url", "")),
+                 time.time() + 2.0)
+    if isinstance(data, dict) and not data.get("error") and \
+            "royaleapi.com" in str(data.get("url", "")):
+        return True
+    _open(backend, "https://royaleapi.com/", URL_JS,
+          lambda d: bool(str(d.get("title", "")).strip()), wait, solve, attempts)
+    data = _poll(backend, URL_JS,
+                 lambda d: "royaleapi.com" in str(d.get("url", "")),
+                 time.time() + 3.0)
+    return isinstance(data, dict) and "royaleapi.com" in str(data.get("url", ""))
+
+
+def _fetch_search(backend, query, wait, solve, attempts):
+    """Search without touching the UI: fetch + DOMParser inside the page."""
+    start_expr = SEARCH_FETCH_START % json.dumps(SEARCH_URL % quote(query))
+    backend.eval_js(start_expr)
+    data = _poll(backend, SEARCH_FETCH_POLL, _fetch_ready,
+                 time.time() + wait, interval=0.3)
+    if not isinstance(data, dict) or data.get("state") == "pending":
+        return {"error": "搜索请求超时"}, None
+    if data.get("state") == "error":
+        return {"error": str(data.get("error"))}, None
+    solved = None
+    if _challenge(data.get("title", ""), data.get("text", "")) and solve:
+        solved = cloudflare.solve(backend, attempts=attempts)
+        if solved.get("solved") or not solved.get("challenge"):
+            backend.eval_js(start_expr)
+            data = _poll(backend, SEARCH_FETCH_POLL, _fetch_ready,
+                         time.time() + wait, interval=0.3)
+            if not isinstance(data, dict) or data.get("state") == "pending":
+                return {"error": "搜索请求超时"}, solved
     return data, solved
 
 
@@ -272,12 +395,14 @@ def _back_to_search(backend, search_url, wait):
 
 
 def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
-                 wait=12.0, solve=True, attempts=2, human=True):
+                 wait=12.0, solve=True, attempts=2, human=True,
+                 direct=False):
     """按玩家名（或 #tag）查最近卡组。
 
     clan 可选：部落名或 #部落标签，用来在同名玩家之间筛人（按卡组页头部核对）；
-    未给 clan 时直接取第 index 个搜索结果。human=True 时按真人方式点结果、
-    点 Decks 标签逐条查看，human=False 直接按 URL 打开。
+    未给 clan 时优先取名字精确匹配的结果，没有才退回第 index 个。human=True 时按真人方式点结果、
+    点 Decks 标签逐条查看，human=False 直接按 URL 打开。direct=True 时搜索改为页面内
+    fetch 静默完成（不导航、不点击），UI 只在最后打开目标玩家的卡组页。
     """
     query = str(name or "").strip()
     if not query:
@@ -285,6 +410,7 @@ def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
     wait = max(2.0, min(float(wait), 60.0))
     index = max(0, int(index))
     max_candidates = max(1, min(int(max_candidates), 20))
+    effective_human = human and not direct
 
     tag = ""
     if query.startswith("#"):
@@ -300,8 +426,15 @@ def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
     if not tag:
         searched = True
         url = SEARCH_URL % quote(query)
-        data, solved = _open(backend, url, SEARCH_JS, _search_ready,
-                             wait, solve, attempts)
+        if direct:
+            if not _ensure_origin(backend, wait, solve, attempts):
+                return {"ok": False,
+                        "error": "浏览器不在 royaleapi.com 页面上，无法静默请求搜索接口",
+                        "stage": "origin"}
+            data, solved = _fetch_search(backend, query, wait, solve, attempts)
+        else:
+            data, solved = _open(backend, url, SEARCH_JS, _search_ready,
+                                 wait, solve, attempts)
         if isinstance(data, dict) and data.get("error"):
             return {"ok": False, "error": data["error"], "stage": "search"}
         candidates = (data or {}).get("results") or []
@@ -309,10 +442,11 @@ def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
             return {"ok": False, "error": "没有搜到玩家",
                     "query": query, "search_url": url,
                     "title": (data or {}).get("title", ""),
-                    "text": (data or {}).get("text", "")}
-        start = 0 if clan else min(index, len(candidates) - 1)
-        # 不给 clan 时只认搜索结果里的这一条，不往后扫：后面同名玩家是
-        # 另一个人，返回他们的卡组就是答非所问。clan 才是逐条核对的理由。
+                    "text": (data or {}).get("text", ""),
+                    "markers": (data or {}).get("markers")}
+        start = _pick_result(candidates, query, clan, index, max_candidates)
+        # 未给 clan 时只打开选中的这一条：其余同名玩家是另一个人，返回
+        # 他们的卡组就是答非所问。clan 才有逐条核对的理由。
         scan = candidates[start:start + (max_candidates if clan else 1)]
     else:
         chosen = {"name": query.lstrip("#"), "tag": "#" + tag,
@@ -334,7 +468,7 @@ def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
         cand_wait = wait if pos == 0 else min(wait, 6.0)
         cand_solved = None
         mode = "direct"
-        if human and searched:
+        if effective_human and searched:
             got = _human_open(backend, start + pos, cand_tag,
                               cand_wait, solve, attempts)
             if got is not None:
@@ -351,7 +485,7 @@ def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
         if cand_solved is not None:
             solved = cand_solved
         if isinstance(data, dict) and data.get("error"):
-            if human and searched and pos < len(scan) - 1:
+            if effective_human and searched and pos < len(scan) - 1:
                 _back_to_search(backend, search_url, wait)
             continue
         info = {
@@ -367,12 +501,12 @@ def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
         checked.append(info)
         more = pos < len(scan) - 1
         if data.get("notFound"):
-            if human and searched and more:
+            if effective_human and searched and more:
                 _back_to_search(backend, search_url, wait)
             continue
         if not _clan_match(clan, (data.get("clan") or {}).get("name", ""),
                            (data.get("clan") or {}).get("tag", "")):
-            if human and searched and more:
+            if effective_human and searched and more:
                 _back_to_search(backend, search_url, wait)
             continue
         chosen = cand
