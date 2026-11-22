@@ -7,7 +7,8 @@ import threading
 from datetime import datetime
 from urllib.parse import quote
 
-from PySide6.QtCore import QSettings, QTimer, QUrl, QUrlQuery, Qt, Signal
+from PySide6.QtCore import (QAbstractNativeEventFilter, QSettings, QTimer, QUrl,
+                           QUrlQuery, Qt, Signal)
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -24,7 +25,8 @@ from .recording import Recorder
 from .mouse import MouseController
 from .pointer import VirtualPointer
 from .traffic import BrowserPage, RequestInterceptor, format_entry
-from .winembed import embed_child, fit_child
+from .winembed import (embed_child, fit_child, focus_child, press_inside,
+                       press_message)
 
 
 EVENT_PREFIX = "@@EV@@"
@@ -129,6 +131,25 @@ class BrowserHost(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._fit()
+
+
+class _PressFocusFilter(QAbstractNativeEventFilter):
+    """Forward real mouse presses to the window that owns the keyboard focus."""
+
+    def __init__(self, owner):
+        super().__init__()
+        self._owner = owner
+
+    def nativeEventFilter(self, event_type, message):
+        try:
+            if b"windows" not in bytes(event_type):
+                return False, 0
+            hwnd, lparam, is_press = press_message(int(message))
+            if is_press:
+                self._owner._on_press(hwnd, lparam)
+        except Exception:
+            pass
+        return False, 0
 
 
 class MainWindow(QMainWindow):
@@ -376,6 +397,13 @@ class MainWindow(QMainWindow):
 
         self.view.setUrl(QUrl("about:blank"))
 
+        # A click into the page must also move the Win32 input focus: the Tk
+        # host owns it, so the view would never receive real key presses.
+        # Chromium eats real clicks on its own native child window, so watch the
+        # press messages; Qt widget events are not generated for that window.
+        self._press_filter = _PressFocusFilter(self)
+        QApplication.instance().installNativeEventFilter(self._press_filter)
+
     def _shortcut(self, keys, handler):
         sc = QShortcut(QKeySequence(keys), self)
         sc.activated.connect(handler)
@@ -444,6 +472,28 @@ class MainWindow(QMainWindow):
             self.traffic.emit({"type": "info", "message": "开始下载: " + target})
         except Exception as exc:
             self.traffic.emit({"type": "info", "message": "下载处理失败: %r" % (exc,)})
+
+    # ------------------------------------------------------ keyboard focus
+
+    def _focus_view(self):
+        """Give the web view both Qt focus and the Win32 keyboard focus."""
+        try:
+            self.view.setFocus(Qt.FocusReason.MouseFocusReason)
+        except Exception:
+            pass
+        try:
+            focus_child(int(self.winId()))
+        except Exception:
+            pass
+
+    def _on_press(self, msg_hwnd, lparam):
+        try:
+            if not press_inside(msg_hwnd, lparam, int(self.winId())):
+                return
+        except Exception:
+            return
+        # Deferred so Qt's input routing is not re-entered from inside it.
+        QTimer.singleShot(0, self._focus_view)
 
     # ------------------------------------------------------------- backend
 
