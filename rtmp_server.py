@@ -34,6 +34,7 @@ HLS_PORT = 8888
 WEBRTC_PORT = 8889
 API_PORT = 9997
 DEFAULT_STREAM_KEY = "crdeck"
+PREFERRED_STREAM_IP = "100.107.25.42"
 FIREWALL_RULE = "CrDeckInspector RTMP 1935"
 
 CONFIG_TEXT = f"""# Generated automatically by CrDeckInspector
@@ -90,11 +91,11 @@ def lan_ips() -> list[str]:
                 continue
             if ip not in result:
                 result.append(ip)
-    primary = default_route_ip()
-    if primary and not primary.startswith(("127.", "169.254.")):
-        if primary in result:
-            result.remove(primary)
-        result.insert(0, primary)
+    for preferred in (default_route_ip(), PREFERRED_STREAM_IP):
+        if preferred and not preferred.startswith(("127.", "169.254.")):
+            if preferred in result:
+                result.remove(preferred)
+            result.insert(0, preferred)
     return result
 
 
