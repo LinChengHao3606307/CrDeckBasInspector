@@ -1,4 +1,12 @@
-"""CrDeckInspector: receives an RTMP stream from the phone's SplitCam Live and previews it locally."""
+"""CrDeckBasInspector: live phone preview, embedded virtual browser and browser controls.
+
+Layout (left to right):
+  * live  - RTMP stream from the phone's SplitCam Live, decoded and previewed;
+  * middle- the QtWebEngine virtual browser, embedded as a child window;
+  * right - browser navigation, API service control and the traffic log.
+
+The live stream and the browser are intentionally not linked yet.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +14,10 @@ import os
 
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
+import json
 import queue
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -40,10 +50,92 @@ MUTED = "#8b949e"
 GREEN = "#3fb950"
 YELLOW = "#d29922"
 RED = "#f85149"
+BLUE = "#4fa8ff"
+PURPLE = "#b48cff"
 FONT = "Segoe UI"
 
 STATUS_COLORS = {"wait": YELLOW, "live": GREEN, "error": RED}
+
 ROOT = Path(__file__).resolve().parent
+BROWSER_READY = "@@READY@@"
+EVENT_PREFIX = "@@EV@@"
+STATE_PREFIX = "@@STATE@@"
+LOG_TAGS = {
+    "request": ("req", BLUE),
+    "response": ("resp", GREEN),
+    "error": ("err", RED),
+    "console": ("err", RED),
+    "ws": ("ws", PURPLE),
+    "info": ("info", MUTED),
+}
+
+
+def _shorten(text: str, limit: int = 150) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "\u2026"
+
+
+def _human_size(size) -> str:
+    try:
+        n = int(size)
+    except (TypeError, ValueError):
+        return ""
+    if n < 1024:
+        return "%d B" % n
+    if n < 1024 * 1024:
+        return "%.1f KB" % (n / 1024.0)
+    return "%.1f MB" % (n / 1048576.0)
+
+
+def format_event(entry: dict) -> tuple[str, str]:
+    """Return (text, tag) for one browser traffic entry."""
+    kind = entry.get("type")
+    if kind == "request":
+        text = "\u2192 %s %s [%s]" % (
+            entry.get("method", "GET"),
+            _shorten(entry.get("url", "")),
+            entry.get("resource", ""),
+        )
+        return text, "req"
+    if kind == "response":
+        source = entry.get("source", "")
+        if entry.get("error"):
+            return "\u2190 ERR %s %s [%s]" % (
+                _shorten(entry.get("url", "")), entry.get("error"), source), "err"
+        status = entry.get("status", 0)
+        bits = []
+        size = _human_size(entry.get("size"))
+        if size:
+            bits.append(size)
+        if entry.get("ms") is not None:
+            bits.append("%s ms" % entry.get("ms"))
+        if entry.get("contentType"):
+            bits.append(str(entry["contentType"]).split(";")[0])
+        if source:
+            bits.append(source)
+        tag = "resp" if 200 <= int(status or 0) < 400 else "err"
+        return "\u2190 %s %s (%s)" % (
+            status, _shorten(entry.get("url", "")), " \u00b7 ".join(bits)), tag
+    if kind == "ws-open":
+        return "\u21c6 WS OPEN %s" % _shorten(entry.get("url", "")), "ws"
+    if kind == "ws-message":
+        return "\u21c6 WS MSG %s %s" % (
+            _shorten(entry.get("url", "")), _shorten(entry.get("data", ""))), "ws"
+    if kind == "ws-close":
+        return "\u21c6 WS CLOSE %s %s %s" % (
+            _shorten(entry.get("url", "")), entry.get("code", ""), entry.get("reason", "")), "ws"
+    if kind == "console":
+        return "[console %s] %s (%s:%s)" % (
+            entry.get("level", ""), _shorten(entry.get("message", "")),
+            _shorten(entry.get("source", ""), 60), entry.get("line", "")), "err"
+    if kind == "nav":
+        return "[page] %s %s" % (entry.get("url", ""), entry.get("note", "")), "info"
+    if kind == "api":
+        return "[api] %s %s %s" % (
+            entry.get("method", ""), entry.get("path", ""), entry.get("note", "")), "info"
+    if kind == "info":
+        return "[info] %s" % entry.get("message", ""), "info"
+    return _shorten(json.dumps(entry, ensure_ascii=False), 220), "info"
 
 
 class CrDeckInspectorApp:
@@ -68,17 +160,31 @@ class CrDeckInspectorApp:
         self._fps_since = time.time()
         self._resolution = ""
 
+        self._browser: subprocess.Popen | None = None
+        self._browser_events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._browser_ready = False
+        self._server_running = False
+        self._sash_placed = False
+        self._url_dirty = False
+
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(15, self._pump)
         self.root.after(100, self._boot_async)
+        self.root.after(400, self._start_browser)
 
     # ---------------- UI ----------------
 
     def _build_ui(self) -> None:
-        self.root.title("CrDeckInspector - Phone Stream Preview")
-        self.root.geometry("1280x860")
-        self.root.minsize(880, 640)
+        self.root.title("CrDeckBasInspector - Live + Virtual Browser")
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win_w = min(1560, int(screen_w * 0.94))
+        win_h = min(900, int(screen_h * 0.90))
+        self.root.geometry(
+            "%dx%d+%d+%d" % (win_w, win_h, max(0, (screen_w - win_w) // 2),
+                             max(0, (screen_h - win_h) // 2))
+        )
+        self.root.minsize(1180, 700)
         self.root.configure(bg=BG)
 
         style = ttk.Style(self.root)
@@ -92,30 +198,25 @@ class CrDeckInspectorApp:
             bordercolor=PANEL_2,
         )
         style.map("Dark.TCombobox", fieldbackground=[("readonly", PANEL_2)])
+        style.configure("Dark.TPanedwindow", background=BG)
+        style.configure("Dark.Vertical.TScrollbar", background=PANEL_2,
+                        troughcolor=BG, arrowcolor=FG, bordercolor=BG)
 
         header = tk.Frame(self.root, bg=PANEL, padx=18, pady=12)
         header.pack(side=tk.TOP, fill=tk.X)
         tk.Label(
-            header,
-            text="CrDeckInspector",
-            bg=PANEL,
-            fg=FG,
-            font=(FONT, 15, "bold"),
+            header, text="CrDeckBasInspector", bg=PANEL, fg=FG, font=(FONT, 15, "bold")
         ).pack(side=tk.LEFT)
         tk.Label(
             header,
-            text="Phone SplitCam Live -> Local RTMP -> Live Preview",
+            text="Phone Live  |  Virtual Browser  |  Browser Control & Traffic Log",
             bg=PANEL,
             fg=MUTED,
             font=(FONT, 10),
         ).pack(side=tk.LEFT, padx=(12, 0))
 
         self.status_label = tk.Label(
-            header,
-            text="● Initializing...",
-            bg=PANEL,
-            fg=YELLOW,
-            font=(FONT, 10, "bold"),
+            header, text="\u25cf Initializing...", bg=PANEL, fg=YELLOW, font=(FONT, 10, "bold")
         )
         self.status_label.pack(side=tk.RIGHT)
 
@@ -133,11 +234,7 @@ class CrDeckInspectorApp:
         ).pack(side=tk.LEFT)
 
         self.ip_box = ttk.Combobox(
-            title_row,
-            width=16,
-            state="readonly",
-            style="Dark.TCombobox",
-            font=(FONT, 9),
+            title_row, width=16, state="readonly", style="Dark.TCombobox", font=(FONT, 9)
         )
         self.ip_box.pack(side=tk.RIGHT)
         self.ip_box.bind("<<ComboboxSelected>>", lambda _event: self._update_url())
@@ -153,14 +250,8 @@ class CrDeckInspectorApp:
             row=0, column=0, sticky="w", padx=(0, 10)
         )
         self.url_entry = tk.Entry(
-            grid,
-            bg=PANEL_2,
-            fg=FG,
-            readonlybackground=PANEL_2,
-            insertbackground=FG,
-            selectbackground="#264f78",
-            relief=tk.FLAT,
-            highlightthickness=0,
+            grid, bg=PANEL_2, fg=FG, readonlybackground=PANEL_2, insertbackground=FG,
+            selectbackground="#264f78", relief=tk.FLAT, highlightthickness=0,
             font=("Consolas", 11),
         )
         self.url_entry.grid(row=0, column=1, sticky="ew", ipady=5)
@@ -170,66 +261,165 @@ class CrDeckInspectorApp:
             row=1, column=0, sticky="w", padx=(0, 10), pady=(8, 0)
         )
         self.key_entry = tk.Entry(
-            grid,
-            bg=PANEL_2,
-            fg=FG,
-            readonlybackground=PANEL_2,
-            insertbackground=FG,
-            selectbackground="#264f78",
-            relief=tk.FLAT,
-            highlightthickness=0,
+            grid, bg=PANEL_2, fg=FG, readonlybackground=PANEL_2, insertbackground=FG,
+            selectbackground="#264f78", relief=tk.FLAT, highlightthickness=0,
             font=("Consolas", 11),
         )
         self.key_entry.grid(row=1, column=1, sticky="ew", ipady=5, pady=(8, 0))
-        self._make_button(grid, "Copy", self._copy_key).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
+        self._make_button(grid, "Copy", self._copy_key).grid(
+            row=1, column=2, padx=(8, 0), pady=(8, 0)
+        )
 
         actions = tk.Frame(footer, bg=PANEL)
         actions.pack(fill=tk.X, pady=(12, 0))
-        self._make_button(actions, "Open Low-Latency Browser Preview", self._open_browser, primary=True).pack(
-            side=tk.LEFT
+        self._make_button(
+            actions, "Open Low-Latency Browser Preview", self._open_browser, primary=True
+        ).pack(side=tk.LEFT)
+        self._make_button(actions, "Restart Receiver", self._restart_server).pack(
+            side=tk.LEFT, padx=(8, 0)
         )
-        self._make_button(actions, "Restart Receiver", self._restart_server).pack(side=tk.LEFT, padx=(8, 0))
 
-        self.firewall_label = tk.Label(
-            actions,
-            text="",
-            bg=PANEL,
-            fg=YELLOW,
-            font=(FONT, 9),
-        )
+        self.firewall_label = tk.Label(actions, text="", bg=PANEL, fg=YELLOW, font=(FONT, 9))
         self.firewall_label.pack(side=tk.RIGHT)
         self.firewall_button = self._make_button(actions, "Allow Port (Admin)", self._elevate_firewall)
 
-        video_box = tk.Frame(self.root, bg="#000000")
-        video_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # ---- three panes: live | browser | controls + log ----
+        body = tk.Frame(self.root, bg=BG)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        self.video_label = tk.Label(video_box, bg="#000000")
+        self.panes = ttk.Panedwindow(body, orient=tk.HORIZONTAL, style="Dark.TPanedwindow")
+        self.panes.pack(fill=tk.BOTH, expand=True)
+        self.panes.bind("<Configure>", self._place_sashes)
+
+        live_pane = tk.Frame(self.panes, bg="#000000")
+        self.panes.add(live_pane, weight=3)
+
+        self.video_label = tk.Label(live_pane, bg="#000000")
         self.video_label.pack(fill=tk.BOTH, expand=True)
 
         self.stats_label = tk.Label(
-            video_box,
-            text="",
-            bg="#000000",
-            fg=MUTED,
-            font=(FONT, 9),
-            padx=10,
-            pady=6,
+            live_pane, text="", bg="#000000", fg=MUTED, font=(FONT, 9), padx=10, pady=6
         )
         self.stats_label.place(relx=1.0, rely=1.0, anchor="se")
 
         self.hint_label = tk.Label(
-            video_box,
-            text="",
-            bg="#000000",
-            fg=MUTED,
-            font=(FONT, 12),
-            justify=tk.CENTER,
-            wraplength=760,
+            live_pane, text="", bg="#000000", fg=MUTED, font=(FONT, 12),
+            justify=tk.CENTER, wraplength=520,
         )
         self.hint_label.place(relx=0.5, rely=0.5, anchor="center")
 
+        self.browser_pane = tk.Frame(self.panes, bg="#05070a")
+        self.panes.add(self.browser_pane, weight=4)
+        self.browser_placeholder = tk.Label(
+            self.browser_pane, text="Starting virtual browser...", bg="#05070a",
+            fg=MUTED, font=(FONT, 11),
+        )
+        self.browser_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
+        side = tk.Frame(self.panes, bg=PANEL, width=330)
+        self.panes.add(side, weight=2)
+        self._build_side_panel(side)
+
         self._refresh_ips()
         self._render_hint()
+
+    def _build_side_panel(self, side: tk.Frame) -> None:
+        pad = {"padx": 12}
+
+        tk.Label(side, text="BROWSER", bg=PANEL, fg=MUTED, font=(FONT, 9, "bold")).pack(
+            anchor="w", pady=(12, 4), **pad
+        )
+
+        self.url_var = tk.StringVar()
+        self.browser_url_entry = tk.Entry(
+            side, textvariable=self.url_var, bg=PANEL_2, fg=FG, insertbackground=FG,
+            selectbackground="#264f78", relief=tk.FLAT, highlightthickness=0,
+            font=("Consolas", 9),
+        )
+        self.browser_url_entry.pack(fill=tk.X, ipady=5, **pad)
+        self.browser_url_entry.bind("<Return>", lambda _event: self._browser_nav())
+        self.browser_url_entry.bind("<Key>", lambda _event: self._mark_url_dirty())
+
+        nav = tk.Frame(side, bg=PANEL)
+        nav.pack(fill=tk.X, pady=(8, 0), **pad)
+        self._mini_button(nav, "Back", lambda: self._browser_send("BACK")).pack(side=tk.LEFT)
+        self._mini_button(nav, "Forward", lambda: self._browser_send("FORWARD")).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        self._mini_button(nav, "Reload", lambda: self._browser_send("RELOAD")).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        self._mini_button(nav, "Go", self._browser_nav, primary=True).pack(side=tk.RIGHT)
+
+        tk.Frame(side, bg=PANEL_2, height=1).pack(fill=tk.X, pady=(14, 0), **pad)
+
+        tk.Label(side, text="API SERVICE", bg=PANEL, fg=MUTED, font=(FONT, 9, "bold")).pack(
+            anchor="w", pady=(12, 4), **pad
+        )
+        svc = tk.Frame(side, bg=PANEL)
+        svc.pack(fill=tk.X, **pad)
+        tk.Label(svc, text="Port", bg=PANEL, fg=MUTED, font=(FONT, 9)).pack(side=tk.LEFT)
+        self.port_var = tk.StringVar(value="8765")
+        tk.Entry(
+            svc, textvariable=self.port_var, width=7, bg=PANEL_2, fg=FG,
+            insertbackground=FG, relief=tk.FLAT, highlightthickness=0,
+            font=("Consolas", 10),
+        ).pack(side=tk.LEFT, padx=(8, 8), ipady=3)
+        self.service_button = self._mini_button(svc, "Start", self._toggle_service)
+        self.service_button.pack(side=tk.LEFT)
+
+        self.service_status = tk.Label(
+            side, text="\u25cf not started", bg=PANEL, fg=MUTED, font=(FONT, 9)
+        )
+        self.service_status.pack(anchor="w", pady=(6, 0), **pad)
+
+        tk.Frame(side, bg=PANEL_2, height=1).pack(fill=tk.X, pady=(14, 0), **pad)
+
+        tk.Label(side, text="VIRTUAL POINTER", bg=PANEL, fg=MUTED, font=(FONT, 9, "bold")).pack(
+            anchor="w", pady=(12, 4), **pad
+        )
+        ptr_row = tk.Frame(side, bg=PANEL)
+        ptr_row.pack(fill=tk.X, **pad)
+        self.pointer_var = tk.BooleanVar(value=True)
+        self.pointer_trail_var = tk.BooleanVar(value=False)
+        for text, var, flag in (("Position ring", self.pointer_var, "POS"),
+                                ("Trail", self.pointer_trail_var, "TRAIL")):
+            tk.Checkbutton(
+                ptr_row, text=text, variable=var, bg=PANEL, fg=MUTED,
+                activebackground=PANEL, activeforeground=FG, selectcolor=PANEL_2,
+                highlightthickness=0, bd=0, font=(FONT, 9),
+                command=lambda f=flag, v=var: self._set_pointer_flag(f, v),
+            ).pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Frame(side, bg=PANEL_2, height=1).pack(fill=tk.X, pady=(14, 0), **pad)
+
+        log_head = tk.Frame(side, bg=PANEL)
+        log_head.pack(fill=tk.X, pady=(12, 4), **pad)
+        tk.Label(log_head, text="TRAFFIC LOG", bg=PANEL, fg=MUTED, font=(FONT, 9, "bold")).pack(
+            side=tk.LEFT
+        )
+        self.pause_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            log_head, text="Pause", variable=self.pause_var, bg=PANEL, fg=MUTED,
+            activebackground=PANEL, activeforeground=FG, selectcolor=PANEL_2,
+            highlightthickness=0, bd=0, font=(FONT, 8),
+        ).pack(side=tk.RIGHT)
+        self._mini_button(log_head, "Clear", self._clear_log).pack(side=tk.RIGHT, padx=(0, 6))
+
+        log_wrap = tk.Frame(side, bg=PANEL)
+        log_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 12), **pad)
+        self.log_text = tk.Text(
+            log_wrap, bg="#0b1016", fg="#c3d0dd", insertbackground=FG, relief=tk.FLAT,
+            wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED, height=10,
+            padx=6, pady=4,
+        )
+        scroll = ttk.Scrollbar(log_wrap, command=self.log_text.yview, style="Dark.Vertical.TScrollbar")
+        self.log_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for tag, color in (("req", BLUE), ("resp", GREEN), ("err", RED),
+                           ("ws", PURPLE), ("info", MUTED)):
+            self.log_text.tag_configure(tag, foreground=color)
 
     def _make_button(self, parent, text: str, command, primary: bool = False) -> tk.Button:
         return tk.Button(
@@ -247,6 +437,196 @@ class CrDeckInspectorApp:
             cursor="hand2",
             font=(FONT, 9, "bold" if primary else "normal"),
         )
+
+    def _mini_button(self, parent, text: str, command, primary: bool = False) -> tk.Button:
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=GREEN if primary else PANEL_2,
+            fg="#04260f" if primary else FG,
+            activebackground="#2ea043" if primary else "#30363d",
+            activeforeground="#04260f" if primary else FG,
+            relief=tk.FLAT,
+            bd=0,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            font=(FONT, 8, "bold" if primary else "normal"),
+        )
+
+    def _place_sashes(self, event=None) -> None:
+        if self._sash_placed:
+            return
+        total = self.panes.winfo_width()
+        if total < 600:
+            return
+        self._sash_placed = True
+        try:
+            self.panes.sashpos(0, 430)
+            self.panes.sashpos(1, total - 340)
+        except tk.TclError:
+            pass
+
+    # ---------------- Browser process ----------------
+
+    def _start_browser(self) -> None:
+        self.browser_pane.update_idletasks()
+        hwnd = self.browser_pane.winfo_id()
+        command = [
+            sys.executable,
+            str(ROOT / "browser_embed.py"),
+            "--parent-hwnd",
+            str(hwnd),
+        ]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # Tk does not follow the system DPI scale, so keep the embedded Qt window
+        # at 1:1 pixels to make both panes agree on sizes.
+        env = dict(
+            os.environ,
+            PYTHONIOENCODING="utf-8",
+            QT_ENABLE_HIGHDPI_SCALING="0",
+            QT_AUTO_SCREEN_SCALE_FACTOR="0",
+            QT_SCALE_FACTOR="1",
+        )
+        try:
+            self._browser = subprocess.Popen(
+                command,
+                cwd=str(ROOT),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+                creationflags=flags,
+            )
+        except Exception as exc:
+            self._set_browser_placeholder("Browser failed to start: %r" % (exc,))
+            self._append_log("[error] browser failed to start: %r" % (exc,), "err")
+            return
+        threading.Thread(target=self._browser_reader, args=(self._browser,), daemon=True).start()
+
+    def _browser_reader(self, proc: subprocess.Popen) -> None:
+        assert proc.stdout is not None
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith(EVENT_PREFIX):
+                    try:
+                        self._browser_events.put(("event", json.loads(line[len(EVENT_PREFIX):])))
+                    except ValueError:
+                        pass
+                elif line.startswith(STATE_PREFIX):
+                    try:
+                        self._browser_events.put(("state", json.loads(line[len(STATE_PREFIX):])))
+                    except ValueError:
+                        pass
+                elif line == BROWSER_READY:
+                    self._browser_events.put(("ready", None))
+        except (OSError, ValueError):
+            pass
+        self._browser_events.put(("exit", proc.poll()))
+
+    def _browser_send(self, line: str) -> bool:
+        proc = self._browser
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            return False
+        try:
+            proc.stdin.write(line + "\n")
+            proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _mark_url_dirty(self) -> None:
+        self._url_dirty = True
+
+    def _set_pointer_flag(self, flag: str, var: tk.BooleanVar) -> None:
+        value = "on" if var.get() else "off"
+        self._browser_send("POINTER %s %s" % (flag, value))
+
+    def _browser_nav(self) -> None:
+        url = self.url_var.get().strip()
+        if url:
+            self._url_dirty = False
+            self._browser_send("NAV " + url)
+
+    def _toggle_service(self) -> None:
+        if self._server_running:
+            self._browser_send("SERVER STOP")
+        else:
+            port = self.port_var.get().strip() or "8765"
+            self._browser_send("SERVER START " + port)
+
+    def _set_browser_placeholder(self, text: str) -> None:
+        self.browser_placeholder.configure(text=text)
+        self.browser_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.browser_placeholder.lift()
+
+    def _drain_browser_events(self) -> None:
+        while True:
+            try:
+                kind, payload = self._browser_events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "ready":
+                self._browser_ready = True
+                self.browser_placeholder.place_forget()
+            elif kind == "event":
+                text, tag = format_event(payload)
+                self._append_log(text, tag)
+            elif kind == "state":
+                self._apply_browser_state(payload)
+            elif kind == "exit":
+                self._browser_ready = False
+                self._server_running = False
+                self.service_status.configure(text="\u25cf browser stopped", fg=RED)
+                self.service_button.configure(text="Start")
+                self._set_browser_placeholder("Virtual browser stopped")
+                self._append_log("[info] virtual browser stopped", "info")
+
+    def _apply_browser_state(self, payload: dict) -> None:
+        kind = payload.get("type")
+        if kind == "url":
+            url = payload.get("url", "")
+            if not self._url_dirty:
+                self.url_var.set(url)
+        elif kind == "server":
+            running = bool(payload.get("running"))
+            self._server_running = running
+            text = payload.get("text") or ("running" if running else "stopped")
+            self.service_status.configure(
+                text="\u25cf " + text, fg=GREEN if running else MUTED
+            )
+            self.service_button.configure(text="Stop" if running else "Start")
+        elif kind == "pointer":
+            var = getattr(self, "pointer_var", None)
+            if var is not None:
+                var.set(bool(payload.get("pos", True)))
+                self.pointer_trail_var.set(bool(payload.get("trail", False)))
+
+    def _append_log(self, text: str, tag: str = "info") -> None:
+        if self.pause_var.get():
+            return
+        widget = self.log_text
+        stamp = time.strftime("%H:%M:%S")
+        widget.configure(state=tk.NORMAL)
+        widget.insert(tk.END, "%s  %s\n" % (stamp, text), tag)
+        lines = int(widget.index("end-1c").split(".")[0])
+        if lines > 1500:
+            widget.delete("1.0", "%d.0" % (lines - 1200))
+        widget.see(tk.END)
+        widget.configure(state=tk.DISABLED)
+
+    def _clear_log(self) -> None:
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
 
     # ---------------- Startup ----------------
 
@@ -285,7 +665,9 @@ class CrDeckInspectorApp:
         threading.Thread(target=self._viewer_loop, daemon=True).start()
 
     def _on_download_progress(self, ratio: float) -> None:
-        self._set_pending_status(f"First run: downloading receiver component {ratio * 100:.0f}%", "wait")
+        self._set_pending_status(
+            f"First run: downloading receiver component {ratio * 100:.0f}%", "wait"
+        )
 
     def _set_pending_status(self, text: str, kind: str = "wait") -> None:
         self._pending_status = (text, kind)
@@ -311,7 +693,9 @@ class CrDeckInspectorApp:
                     paths = active_paths()
                     current_path = paths[0] if paths else ""
                 if not current_path:
-                    self._set_pending_status("Waiting for phone stream... (tap Start Live in SplitCam)", "wait")
+                    self._set_pending_status(
+                        "Waiting for phone stream... (tap Start Live in SplitCam)", "wait"
+                    )
                     self._pending_hint = True
                     time.sleep(0.8)
                     continue
@@ -400,11 +784,12 @@ class CrDeckInspectorApp:
         if self._booted and not self.server.alive:
             self._apply_status('Receiver stopped, click "Restart Receiver"', "error")
 
+        self._drain_browser_events()
         self.root.after(15, self._pump)
 
     def _apply_status(self, text: str, kind: str) -> None:
         self._status_text = text
-        self.status_label.configure(text=f"● {text}", fg=STATUS_COLORS.get(kind, MUTED))
+        self.status_label.configure(text=f"\u25cf {text}", fg=STATUS_COLORS.get(kind, MUTED))
 
     def _show_frame(self, frame: np.ndarray) -> None:
         width = self.video_label.winfo_width()
@@ -463,7 +848,9 @@ class CrDeckInspectorApp:
             self.firewall_label.configure(text="")
             self.firewall_button.pack_forget()
         else:
-            self.firewall_label.configure(text="Port 1935 is not allowed, the phone may fail to connect ->")
+            self.firewall_label.configure(
+                text="Port 1935 is not allowed, the phone may fail to connect ->"
+            )
             self.firewall_button.pack(side=tk.RIGHT, padx=(0, 10))
 
     def _elevate_firewall(self) -> None:
@@ -534,8 +921,27 @@ class CrDeckInspectorApp:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _stop_browser(self) -> None:
+        proc, self._browser = self._browser, None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write("QUIT\n")
+                proc.stdin.flush()
+                proc.wait(timeout=3)
+        except Exception:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+
     def _on_close(self) -> None:
         self.stop_event.set()
+        self._stop_browser()
         self.server.stop()
         self.root.destroy()
 

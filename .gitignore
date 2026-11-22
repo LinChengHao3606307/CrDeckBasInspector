@@ -8,3 +8,7 @@ venv/
 
 # Local runtime files (downloaded MediaMTX, generated config/logs)
 tools/
+
+# Embedded browser runtime data (Chromium profile, recordings)
+profile/
+recordings/
