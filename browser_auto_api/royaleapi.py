@@ -225,7 +225,8 @@ SEARCH_FETCH_START = """
 
 # Token-direct search: the query is sent as a same-origin fetch (it carries the
 # Cloudflare cookies), the HTML fragment is parsed offscreen with DOMParser and
-# only the candidate list is returned. The visible page is never navigated.
+# only the candidate list is returned. The visible page is navigated only when
+# a fetch challenge must be exposed to the clearance solver.
 SEARCH_FETCH_POLL = """
 (function(){
   var html = window.__crSearchHTML;
@@ -267,11 +268,21 @@ SEARCH_FETCH_POLL = """
 """
 
 
+def _fetch_challenge(d):
+    """识别 fetch 返回的 CF 页；无结果时也必须结束轮询并进入过检流程。"""
+    d = d or {}
+    markers = d.get("markers") or {}
+    return (_challenge(d.get("title", ""), d.get("text", ""))
+            or bool(markers.get("cloudflare")))
+
+
 def _fetch_ready(d):
     state = d.get("state")
     if state == "pending":
         return False
     if state in ("error", "done"):
+        if state == "done" and _fetch_challenge(d):
+            return True
         if state == "done" and not d.get("results"):
             # Terminal only when the fragment clearly says no players;
             # otherwise keep polling in case the fragment is still parsing.
@@ -308,7 +319,15 @@ def _fetch_search(backend, query, wait, solve, attempts):
     if data.get("state") == "error":
         return {"error": str(data.get("error"))}, None
     solved = None
-    if _challenge(data.get("title", ""), data.get("text", "")) and solve:
+    if _fetch_challenge(data) and solve:
+        # fetch 在后台收到挑战时，可见页面可能仍是普通页面；直接调用
+        # cloudflare.solve 会误判“当前页面不是校验页”。先把可见页导航到
+        # 同一个搜索地址，让求解器看到真实挑战并回灌 clearance，再重试 fetch。
+        search_url = SEARCH_URL % quote(query)
+        backend.navigate_async(search_url)
+        _poll(backend, URL_JS,
+              _ready_on(search_url, lambda d: bool(str(d.get("title", "")).strip())),
+              time.time() + wait)
         solved = cloudflare.solve(backend, attempts=attempts)
         if solved.get("solved") or not solved.get("challenge"):
             backend.eval_js(start_expr)
@@ -437,6 +456,13 @@ def deck_by_name(backend, name, clan="", index=0, max_candidates=10,
                                  wait, solve, attempts)
         if isinstance(data, dict) and data.get("error"):
             return {"ok": False, "error": data["error"], "stage": "search"}
+        if _fetch_challenge(data):
+            result = {"ok": False, "error": "Cloudflare 校验未通过",
+                      "stage": "cloudflare", "query": query,
+                      "title": (data or {}).get("title", "")}
+            if solved is not None:
+                result["cloudflare"] = solved
+            return result
         candidates = (data or {}).get("results") or []
         if not candidates:
             return {"ok": False, "error": "没有搜到玩家",
