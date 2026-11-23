@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 from . import config
 from .api_server import ApiServer, JobDispatcher
 from .backend import Backend
-from .js_scripts import TRAFFIC_SCRIPT, VIEWPORT_SCRIPT
+from .js_scripts import STEALTH_SCRIPT, TRAFFIC_SCRIPT
 from .recording import Recorder
 from .mouse import MouseController
 from .pointer import VirtualPointer
@@ -57,6 +57,10 @@ def _emit_state(payload):
 
 VIEW_WIDTH = 1920
 VIEW_HEIGHT = 1080
+# UA 保持 Reduced UA 形式 major.0.0.0：本机真 Chrome 157 实测
+# navigator.userAgent 为 "Chrome/157.0.0.0"，完整构建号只出现在 UA-CH 高熵值
+# （sec-ch-ua-full-version-list / userAgentData.getHighEntropyValues）里。
+# 曾误改成 140.0.7339.225，那才是真 Chrome 不会发出的异常 UA。
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
 
@@ -355,23 +359,30 @@ class MainWindow(QMainWindow):
             profile.setDownloadPath(os.path.expanduser("~/Downloads"))
         # 默认 UA 带 QtWebEngine 标记，会被 Cloudflare 判成机器人；换成标准 Chrome UA
         profile.setHttpUserAgent(USER_AGENT)
-        profile.setHttpAcceptLanguage("zh-CN,zh,en-US,en")
+        # Accept-Language 同时决定 navigator.languages；与 browser_embed.py 的
+        # --lang=en-US（决定 Intl 默认 locale）保持一致，对齐同机同 IP 已过检的
+        # 真 Chrome 基线（languages=[en-US,en]、Intl locale=en-US）。此前的
+        # zh-CN,zh,en-US,en + Intl "en" 是语言自述互相矛盾的嵌入式特征。
+        profile.setHttpAcceptLanguage("en-US,en")
 
         self._interceptor = RequestInterceptor(lambda entry: self.traffic.emit(entry), self)
         profile.setUrlRequestInterceptor(self._interceptor)
 
+        # 流量钩子放进隔离世界：页面主世界的 fetch/XHR/WebSocket 保持原生，
+        # Cloudflare 的 toString 指纹检测看不到任何改动；console 上报仍可跨世界送达。
+        # 页面级请求本身由 RequestInterceptor 在网络层完整记录。
         script = QWebEngineScript()
         script.setName("autoapi-traffic")
         script.setSourceCode(TRAFFIC_SCRIPT)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
         script.setRunsOnSubFrames(True)
         profile.scripts().insert(script)
 
-        # 视口是虚拟的 1920x1080，屏幕指标要与之自洽（见 VIEWPORT_SCRIPT）
+        # 隐身补丁在主世界执行（含 Turnstile 跨源 iframe），修正插件/chrome/色深等指纹
         script = QWebEngineScript()
-        script.setName("autoapi-viewport")
-        script.setSourceCode(VIEWPORT_SCRIPT)
+        script.setName("autoapi-stealth")
+        script.setSourceCode(STEALTH_SCRIPT)
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
         script.setRunsOnSubFrames(True)

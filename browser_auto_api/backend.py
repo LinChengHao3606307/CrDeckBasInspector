@@ -105,6 +105,140 @@ class Backend(QObject):
 
         return self._dispatcher.submit(fn, timeout=10)
 
+    # ---------- 硬件级 SendInput 点击 ----------
+
+    def hardware_click(self, css_x, css_y, css_away=None, timeout=25.0):
+        """用独立 DPI-aware 子进程投递真实 OS 鼠标事件（SendInput）。
+
+        PostMessage 合成的 WM_ 消息会被 Turnstile 服务端判为非可信输入；
+        真实硬件事件走这里。Qt 主线程只负责读 hwnd/zoom，子进程在调用
+        线程上跑，避免把事件循环阻塞两秒以上。失败时抛异常，由调用方
+        回退到 PostMessage 路径。
+        """
+        import os
+        import subprocess
+        import sys
+
+        from . import config
+
+        if sys.platform != "win32":
+            raise RuntimeError("硬件输入仅支持 Windows")
+
+        def gather(job):
+            import ctypes
+            from PySide6.QtCore import QPoint
+
+            view = self._view
+            zoom = float(view.zoomFactor()) or 1.0
+            # 宿主 Qt 进程是 DPI 不感知的，mapToGlobal/width 都在系统虚拟化
+            # 坐标系里；GetScaleFactorForDevice 不受感知级别影响，能拿到真实
+            # 缩放（本机 150%），乘回去即渲染表面的物理屏幕矩形。
+            try:
+                pct = ctypes.windll.shcore.GetScaleFactorForDevice(0)
+                scale = (pct / 100.0) if pct and 50 <= pct <= 500 else 1.0
+            except Exception:
+                scale = 1.0
+            origin = view.mapToGlobal(QPoint(0, 0))
+            left = int(round(origin.x() * scale))
+            top = int(round(origin.y() * scale))
+            right = left + int(round(view.width() * scale))
+            bottom = top + int(round(view.height() * scale))
+            return {"view_hwnd": int(view.winId()),
+                    "css_w": view.width() / zoom,
+                    "css_h": view.height() / zoom,
+                    "rect": (left, top, right, bottom)}
+
+        info = self._dispatcher.submit(gather, timeout=10)
+        worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "hardware_worker.py")
+        args = [sys.executable, worker, "click",
+                "--view-hwnd", str(info["view_hwnd"]),
+                "--css", str(float(css_x)), str(float(css_y)),
+                "--view-size", str(info["css_w"]), str(info["css_h"]),
+                "--expect-rect", *[str(v) for v in info["rect"]],
+                "--debug"]
+        if css_away is not None:
+            args += ["--away", str(float(css_away[0])), str(float(css_away[1]))]
+
+        # 独立进程组：venv 的 python.exe 是再启动器，超时时必须 /T 连整个
+        # 进程树一起杀，否则基础解释器可能成为孤儿继续移动鼠标。
+        # stdin 必须显式 DEVNULL：浏览器进程的 stdin 是 Tk 宿主的命令管道，
+        # 子进程继承该管道句柄会在解释器启动阶段挂死（实测无任何输出直到
+        # 超时），而 worker 本来就不需要 stdin。
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=creationflags,
+            encoding="utf-8", errors="replace")
+        t_start = __import__("time").perf_counter()
+
+        def _log_worker(rc, stdout, stderr, note=""):
+            # 诊断落盘：每次 worker 调用的现场（含点击前后窗口归属）都进
+            # .work/cfdiag/worker_runs.log，不依赖调用方是否抛异常。
+            try:
+                import os as _os
+                import time as _time
+                log_dir = _os.path.join(config.APP_DIR, ".work", "cfdiag")
+                _os.makedirs(log_dir, exist_ok=True)
+                lines = (stdout or "").strip().splitlines()
+                payload = {
+                    "at": _time.strftime("%H:%M:%S"),
+                    "elapsed": round(__import__("time").perf_counter() - t_start, 3),
+                    "css": [css_x, css_y],
+                    "away": css_away,
+                    "rc": rc,
+                    "note": note,
+                    "stdout": lines[-1] if lines else "",
+                    "stderr": (stderr or "").strip()[-1200:],
+                }
+                with open(_os.path.join(log_dir, "worker_runs.log"),
+                          "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=5)
+            except Exception:
+                proc.kill()
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
+            _log_worker(-1, stdout, stderr, note="timeout")
+            raise RuntimeError("硬件输入子进程超时(>%.0fs)，已杀进程树；阶段日志: %s"
+                               % (timeout, (stderr or stdout or "(无输出)").strip()[-500:]))
+        out = (stdout or "").strip().splitlines()
+        if proc.returncode != 0 or not out:
+            detail = (stderr or stdout or "no output").strip()[-500:]
+            _log_worker(proc.returncode, stdout, stderr, note="bad-rc")
+            raise RuntimeError("硬件输入子进程失败(rc=%d): %s" % (proc.returncode, detail))
+        data = json.loads(out[-1])
+        _log_worker(proc.returncode, stdout, stderr)
+        if not data.get("ok"):
+            raise RuntimeError("硬件输入失败: %s | %s"
+                               % (data.get("error", "unknown"),
+                                  (stderr or "").strip()[-300:]))
+
+        # 虚拟指针覆盖层同步到离开点（真实光标已经在那里）。
+        try:
+            px, py = css_away if css_away is not None else (css_x, css_y)
+
+            def sync(job):
+                if self.pointer is not None:
+                    self.pointer.move_to(float(px), float(py))
+
+            self._dispatcher.submit(sync, timeout=5)
+        except Exception:
+            pass
+        return data
+
     # ---------- POST cookies ----------
 
     def clear_cookies(self, domain="", name=""):

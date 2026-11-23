@@ -8,6 +8,53 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineUrlRequestIntercep
 
 PREFIX = "__AUTOAPI__"
 
+# QtWebEngine 是无品牌 Chromium：sec-ch-ua / navigator.userAgentData 里只有
+# GREASE 占位品牌和 Chromium，缺 "Google Chrome"，与 UA 字符串（自称 Chrome）
+# 和 navigator.vendor（Google Inc.）自相矛盾，是 Turnstile 的强自动化信号。
+# 这里按真实引擎版本 140 补齐品牌（构建号 140.0.7339.225 与实际 Chromium 一致，
+# 不冒充更高版本），HTTP 头与 JS 对象两侧同时改，保持互相自洽。
+#
+# 品牌内容与排列顺序都不是自由文本，由 Chromium 按主版本号确定性生成
+# （chromium/components/embedder_support/user_agent_utils.cc）：
+#   GREASE 字符表 [" ","(",":","-",".","/",")",";","=","?","_"]，取 seed%11 与
+#   (seed+1)%11 两个字符；GREASE 版本从 ["8","99","24"] 取 seed%3。
+#   初始列表 [GREASE, Chromium, Google Chrome] 再按 orders[seed%6] 洗牌。
+# seed=140：GREASE="Not=A?Brand"/24，orders[2]={1,0,2} → 顺序为
+#   Chromium → Not=A?Brand → Google Chrome。
+# 该算法对 seed=157 的推导（Not-A.Brand/99 且 GREASE 在最前）与本机真 Chrome
+# 157 实测逐字一致，可信。此前写成 GREASE→Google Chrome→Chromium，是真实
+# Chrome 140 从未发出过的排列，等于自报伪造。
+BRANDED_CH_UA = ('"Chromium";v="140", "Not=A?Brand";v="24", '
+                 '"Google Chrome";v="140"')
+BRANDED_CH_UA_FULL = ('"Chromium";v="140.0.7339.225", '
+                      '"Not=A?Brand";v="24.0.0.0", '
+                      '"Google Chrome";v="140.0.7339.225"')
+# 只替换会暴露品牌列表的两个头；arch/bitness/platform-version 等标量头本身正确，
+# 不动它们。
+_CH_UA_REWRITE = {
+    "sec-ch-ua": BRANDED_CH_UA,
+    "sec-ch-ua-full-version-list": BRANDED_CH_UA_FULL,
+}
+
+
+def format_brand_header(brands):
+    """把 userAgentData.brands / fullVersionList 还原成 sec-ch-ua 头文本。"""
+    return ", ".join('"%s";v="%s"' % (b.get("brand", ""), b.get("version", ""))
+                     for b in (brands or []))
+
+
+def set_brand_headers(brands, full_version_list):
+    """用真实 Chrome 实测的品牌列表覆盖重写值。
+
+    chrome_solver 过检后会把真实 Chrome 的 brands/fullVersionList 带回来；
+    此时 UA 也会同步改成该 Chrome 的 UA，头、JS 对象、UA 三者保持一致。
+    """
+    if brands:
+        _CH_UA_REWRITE["sec-ch-ua"] = format_brand_header(brands)
+    if full_version_list:
+        _CH_UA_REWRITE["sec-ch-ua-full-version-list"] = \
+            format_brand_header(full_version_list)
+
 
 def _text(value):
     try:
@@ -29,6 +76,20 @@ class RequestInterceptor(QWebEngineUrlRequestInterceptor):
 
     def interceptRequest(self, info):
         try:
+            # 先改写品牌列表头，再快照，保证日志记录的是实际发出的值。
+            # 只替换已存在的头：sec-ch-ua 每次请求都发；full-version-list 仅在
+            # 服务器 Accept-CH 要求时 Chromium 才会带，不主动注入，和真 Chrome 一致。
+            try:
+                raw = info.httpHeaders()
+                for key, _value in (raw.items() if hasattr(raw, "items") else raw):
+                    name = _text(key)
+                    replacement = _CH_UA_REWRITE.get(name.lower())
+                    if replacement:
+                        info.setHttpHeader(
+                            QByteArray(name.encode("utf-8")),
+                            QByteArray(replacement.encode("utf-8")))
+            except Exception:
+                pass
             headers = {}
             try:
                 raw = info.httpHeaders()

@@ -6,6 +6,7 @@ Turnstile 小组件在封闭 shadow DOM 里，从文档 DOM 查不到内部 ifra
 """
 
 import random
+import sys
 import time
 
 from .api_server import PENDING
@@ -380,7 +381,135 @@ def _run_log(record):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def solve(backend, attempts=3, find_timeout=25.0, click_timeout=20.0):
+def _apply_clearance(backend, payload):
+    """把真实 Chrome 的 UA / UA-CH / cookie 回灌进内嵌 profile（Qt 主线程执行）。"""
+    def fn(job):
+        from PySide6.QtCore import QDateTime
+        from PySide6.QtNetwork import QNetworkCookie
+        from PySide6.QtWebEngineCore import QWebEngineScript
+        from . import js_scripts, traffic
+
+        profile = backend._page.profile()
+        if payload.get("ua"):
+            profile.setHttpUserAgent(payload["ua"])
+        traffic.set_brand_headers(payload.get("brands"),
+                                  payload.get("fullVersionList"))
+
+        # 重建 stealth 脚本：UA-CH 的 JS 侧也要变成真实 Chrome 的实测值
+        scripts = profile.scripts()
+        # PySide6 的绑定叫 find（返回列表），不是 Qt 文档里的 findScript
+        for old in list(scripts.find("autoapi-stealth")):
+            scripts.remove(old)
+        script = QWebEngineScript()
+        script.setName("autoapi-stealth")
+        script.setSourceCode(js_scripts.stealth_source({
+            "brands": payload.get("brands"),
+            "fullVersionList": payload.get("fullVersionList"),
+            "scalar": payload.get("scalar"),
+        }))
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+        scripts.insert(script)
+
+        store = profile.cookieStore()
+        count = 0
+        errors = []
+        for c in payload.get("cookies") or []:
+            try:
+                cookie = QNetworkCookie(str(c["name"]).encode("utf-8"),
+                                        str(c["value"]).encode("utf-8"))
+                cookie.setDomain(str(c.get("domain") or ""))
+                cookie.setPath(str(c.get("path") or "/"))
+                cookie.setSecure(bool(c.get("secure")))
+                cookie.setHttpOnly(bool(c.get("httpOnly")))
+                exp = c.get("expires")
+                if exp and float(exp) > 0:
+                    cookie.setExpirationDate(QDateTime.fromSecsSinceEpoch(int(exp)))
+                store.setCookie(cookie)
+                count += 1
+            except Exception as exc:
+                errors.append(repr(exc))
+                continue
+        return {"cookies": count, "ua": profile.httpUserAgent(),
+                "received": len(payload.get("cookies") or []),
+                "errors": errors[:3]}
+
+    return backend._dispatcher.submit(fn, timeout=25)
+
+
+def _chrome_clearance(backend, url, started):
+    """内嵌引擎被 Turnstile 拒收时，用真实 Chrome 后台 CDP 取通关凭证。
+
+    对照实验：同机同 IP，真 Chrome 的硬件点击和 CDP 页面输入都能通过，
+    QtWebEngine 则反复 verifying→reset。默认 CDP 路径不前置窗口、不调用
+    SendInput、不移动系统光标；cf_clearance 回灌时同步 UA/UA-CH，保持一致。
+    """
+    import os
+    from . import chrome_solver, config
+    if not chrome_solver.find_chrome():
+        return None
+    logs = []
+    try:
+        # 必须走独立子进程：本进程（Qt 浏览器子进程）DPI 不感知且 stdin 是
+        # Tk 宿主命令管道，进程内直接 solve() 会出现坐标虚拟化 + worker 挂死。
+        payload = chrome_solver.solve_in_subprocess(
+            url, debug_dir=os.path.join(config.APP_DIR, ".work", "cfdiag"))
+        logs = payload.pop("solverLog", []) or []
+    except Exception as exc:
+        return {"ok": False, "challenge": True, "solved": False,
+                "method": "chrome-clearance", "error": repr(exc),
+                "chromeLog": logs[-10:],
+                "elapsedMs": int((time.time() - started) * 1000)}
+    # 只回灌目标站自己的 cookie（cf_clearance/__cf_bm/session 等），
+    # 真实 Chrome 首页加载带回来的广告第三方 cookie 一律丢弃。
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+
+    def _same_site(c):
+        d = str(c.get("domain") or "").lstrip(".").lower()
+        return bool(d) and (host == d or host.endswith("." + d)
+                            or d.endswith("." + host))
+
+    payload["cookies"] = [c for c in payload.get("cookies") or [] if _same_site(c)]
+    try:
+        applied = _apply_clearance(backend, payload)
+        backend.navigate(url)
+        time.sleep(1.0)
+        probe = _probe(backend)
+        if not _is_challenge(probe):
+            stable, check = _stable_clear(backend)
+            if stable:
+                check = check or probe
+                result = {"ok": True, "challenge": True, "solved": True,
+                          "method": "chrome-clearance",
+                          "input": payload.get("input") or "cdp",
+                          "chromeClicks": payload.get("clicks"),
+                          "elapsedMs": int((time.time() - started) * 1000),
+                          "title": check.get("title", ""), "url": check.get("url", ""),
+                          "cookies": applied.get("cookies"),
+                          "chromeTitle": payload.get("title", "")}
+                _run_log({"solved": True, "method": "chrome-clearance",
+                          "elapsedMs": result["elapsedMs"],
+                          "cookies": applied.get("cookies")})
+                return result
+        return {"ok": False, "challenge": True, "solved": False,
+                "method": "chrome-clearance", "note": "回灌后仍是校验页",
+                "title": probe.get("title", ""), "url": probe.get("url", ""),
+                "cookies": applied.get("cookies"),
+                "received": applied.get("received"),
+                "cookieErrors": applied.get("errors"),
+                "appliedUa": applied.get("ua"),
+                "chromeLog": logs[-10:],
+                "elapsedMs": int((time.time() - started) * 1000)}
+    except Exception as exc:
+        return {"ok": False, "challenge": True, "solved": False,
+                "method": "chrome-clearance", "error": repr(exc),
+                "elapsedMs": int((time.time() - started) * 1000)}
+
+
+def solve(backend, attempts=3, find_timeout=25.0, click_timeout=20.0,
+          input_mode="cdp"):
     started = time.time()
     try:
         probe = _probe(backend)
@@ -391,6 +520,20 @@ def solve(backend, attempts=3, find_timeout=25.0, click_timeout=20.0):
                 "title": probe.get("title", ""), "url": probe.get("url", ""),
                 "note": "当前页面不是 Cloudflare 校验页"}
 
+    if input_mode == "cdp":
+        # 默认无鼠标路径：直接让真实 Chrome 在后台用 CDP 过检并回灌。
+        # 绝不能先走下面的 Qt 硬件点击，也不能失败后静默回退 SendInput。
+        if sys.platform == "win32":
+            rescue = _chrome_clearance(backend, probe.get("url"), started)
+            if rescue is not None:
+                rescue["tried"] = []
+                rescue["input"] = rescue.get("input") or "cdp"
+                return rescue
+        return {"ok": False, "challenge": True, "solved": False,
+                "method": "chrome-clearance", "input": "cdp",
+                "error": "无鼠标 CDP 路径需要 Windows 和真实 Chrome",
+                "elapsedMs": int((time.time() - started) * 1000)}
+
     attempts = max(1, min(int(attempts), 5))
     tried = []
     warm = _probe(backend)
@@ -398,10 +541,21 @@ def solve(backend, attempts=3, find_timeout=25.0, click_timeout=20.0):
     front = _front_window(backend)
     time.sleep(0.4)
     env_after = _env(backend)
+    # 硬件路径：独立 DPI-aware 进程发真实 SendInput。对照实验证明 PostMessage
+    # 合成事件会被 Turnstile 服务端拒绝（verifying 后复位），真实硬件事件
+    # 数秒内即通过。worker 不可用时整轮回退到原 PostMessage 路径。
+    hardware = input_mode == "hardware" and sys.platform == "win32" \
+        and hasattr(backend, "hardware_click")
+    input_used = None
     vp = backend.viewport_size()
     cur = (vp[0] * random.uniform(0.62, 0.85), vp[1] * random.uniform(0.62, 0.88))
-    # 真人到校验页后停留一两秒、指针活动几段，再去点组件
-    cur = _wander(backend, cur, random.uniform(2.0, 4.0))
+    if hardware:
+        # 硬件路径不预先注入任何合成指针事件：纯净的真实移动+点击即可通过，
+        # 合成历史反而可能成为负面信号，只保留真人式停留。
+        time.sleep(random.uniform(1.2, 2.4))
+    else:
+        # 真人到校验页后停留一两秒、指针活动几段，再去点组件
+        cur = _wander(backend, cur, random.uniform(2.0, 4.0))
     for attempt_no in range(1, attempts + 1):
         widget = _await_clickable(backend, time.time() + find_timeout)
         if widget is None:
@@ -411,34 +565,65 @@ def solve(backend, attempts=3, find_timeout=25.0, click_timeout=20.0):
         # 落点在勾选框内，纵向在中线附近。
         lx = widget["x"] + random.uniform(11.0, 28.0)
         ly = widget["y"] + h * 0.5 + random.uniform(-3.0, 4.0)
+        # 点完立刻挪开的落点（两种输入路径共用）。
+        vx, vy = backend.viewport_size()
+        ax = min(vx - 40.0, max(40.0, lx + random.choice((-1.0, 1.0)) * random.uniform(40.0, 140.0)))
+        ay = min(vy - 40.0, max(40.0, ly + random.uniform(-60.0, 90.0)))
         # 直接从当前位置挪到勾选框上点一下，点完立刻挪开；勾选框再次出现
         # 说明这一轮没过，下一轮再挪回来点。
         try:
-            time.sleep(random.uniform(0.2, 0.6))
-            _glide(backend, cur[0], cur[1], lx, ly, random.uniform(0.55, 0.9))
-            time.sleep(random.uniform(0.10, 0.24))
-            # 接近过程中 CF 可能自己切换到验证中，或勾选框还没画出来；
-            # 这时按下只会把它打断，等于白费一轮
-            try:
-                card = _grab_card(backend)
-            except Exception:
-                card = None
-            busy = card is None or not card.get("ready")
-            try:
-                ready = _probe(backend)
-            except Exception:
-                ready = None
-            if busy or (ready is not None and _verifying(ready)):
-                tried.append({"attempt": attempt_no, "result": "widget-busy"})
-                continue
-            _press(backend, lx, ly, random.uniform(0.047, 0.093), jitter=0)
-            cur = (lx, ly)
-            time.sleep(random.uniform(0.12, 0.30))
-            vx, vy = backend.viewport_size()
-            ax = min(vx - 40.0, max(40.0, lx + random.choice((-1.0, 1.0)) * random.uniform(40.0, 140.0)))
-            ay = min(vy - 40.0, max(40.0, ly + random.uniform(-60.0, 90.0)))
-            _approach(backend, lx, ly, ax, ay, seconds=random.uniform(0.3, 0.55))
-            cur = (ax, ay)
+            did_hw = False
+            if hardware:
+                time.sleep(random.uniform(0.25, 0.7))
+                # 点击前最后确认：CF 可能自己切换到验证中，或勾选框还没画出来，
+                # 这时按下只会把它打断，等于白费一轮。
+                try:
+                    card = _grab_card(backend)
+                except Exception:
+                    card = None
+                try:
+                    ready = _probe(backend)
+                except Exception:
+                    ready = None
+                if card is None or not card.get("ready") \
+                        or (ready is not None and _verifying(ready)):
+                    tried.append({"attempt": attempt_no, "result": "widget-busy"})
+                    continue
+                try:
+                    backend.hardware_click(lx, ly, css_away=(ax, ay))
+                    did_hw = True
+                    input_used = "hardware"
+                    cur = (ax, ay)
+                except Exception as exc:
+                    # worker 起不来或坐标越界：本次求解剩余轮次回退合成路径
+                    hardware = False
+                    input_used = "synthetic"
+                    tried.append({"attempt": attempt_no,
+                                  "result": "hardware-fallback", "error": repr(exc)})
+            if not did_hw:
+                input_used = "synthetic"
+                time.sleep(random.uniform(0.2, 0.6))
+                _glide(backend, cur[0], cur[1], lx, ly, random.uniform(0.55, 0.9))
+                time.sleep(random.uniform(0.10, 0.24))
+                # 接近过程中 CF 可能自己切换到验证中，或勾选框还没画出来；
+                # 这时按下只会把它打断，等于白费一轮
+                try:
+                    card = _grab_card(backend)
+                except Exception:
+                    card = None
+                busy = card is None or not card.get("ready")
+                try:
+                    ready = _probe(backend)
+                except Exception:
+                    ready = None
+                if busy or (ready is not None and _verifying(ready)):
+                    tried.append({"attempt": attempt_no, "result": "widget-busy"})
+                    continue
+                _press(backend, lx, ly, random.uniform(0.047, 0.093), jitter=0)
+                cur = (lx, ly)
+                time.sleep(random.uniform(0.12, 0.30))
+                _approach(backend, lx, ly, ax, ay, seconds=random.uniform(0.3, 0.55))
+                cur = (ax, ay)
         except Exception as exc:
             tried.append({"attempt": attempt_no, "result": "click-error", "error": repr(exc)})
             continue
@@ -463,10 +648,12 @@ def solve(backend, attempts=3, find_timeout=25.0, click_timeout=20.0):
                     check = check or now
                     result = {"ok": True, "challenge": True, "solved": True,
                               "method": "click", "attempts": attempt_no,
+                              "input": input_used,
                               "elapsedMs": int((time.time() - started) * 1000),
                               "widget": widget, "title": check.get("title", ""),
                               "url": check.get("url", ""), "tried": tried}
                     _run_log({"solved": True, "attempt": attempt_no, "tried": tried,
+                              "input": input_used,
                               "elapsedMs": result["elapsedMs"],
                               "warmTitle": warm.get("title", ""),
                               "env": env, "envAfter": env_after, "front": front})
@@ -488,10 +675,18 @@ def solve(backend, attempts=3, find_timeout=25.0, click_timeout=20.0):
         final = _probe(backend)
     except Exception:
         final = {}
+    if _is_challenge(final) and sys.platform == "win32":
+        rescue = _chrome_clearance(backend, final.get("url") or probe.get("url"),
+                                   started)
+        if rescue is not None:
+            rescue["tried"] = tried
+            rescue["input"] = rescue.get("input") or input_used
+            return rescue
     _run_log({"solved": bool(not _is_challenge(final)), "attempt": attempts,
-              "tried": tried, "warmTitle": warm.get("title", ""),
+              "tried": tried, "input": input_used,
+              "warmTitle": warm.get("title", ""),
               "env": env, "envAfter": env_after, "front": front})
     return {"ok": False, "challenge": True, "solved": bool(not _is_challenge(final)),
-            "attempts": attempts, "tried": tried,
+            "attempts": attempts, "tried": tried, "input": input_used,
             "elapsedMs": int((time.time() - started) * 1000),
             "title": final.get("title", ""), "url": final.get("url", "")}
