@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from quick_view import QuickViewServer
 from rtmp_server import (
     DEFAULT_STREAM_KEY,
     RTMP_PORT,
@@ -183,8 +184,10 @@ class CrDeckInspectorApp:
         self._ocr_events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._last_ocr_at = 0.0
         self._lookup_busy = False
+        self.quick_view = None
 
         self._build_ui()
+        self._restart_quick_view()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(15, self._pump)
         self.root.after(100, self._boot_async)
@@ -403,6 +406,22 @@ class CrDeckInspectorApp:
             highlightthickness=0, bd=0, font=(FONT, 9),
         ).pack(anchor="w", pady=(6, 0), **pad)
 
+        tk.Label(side, text="LAN QUICK VIEW", bg=PANEL, fg=MUTED,
+                 font=(FONT, 9, "bold")).pack(anchor="w", pady=(12, 4), **pad)
+        quick = tk.Frame(side, bg=PANEL)
+        quick.pack(fill=tk.X, **pad)
+        tk.Label(quick, text="Port", bg=PANEL, fg=MUTED, font=(FONT, 9)).pack(side=tk.LEFT)
+        self.quick_port_var = tk.StringVar(value=str(self._load_quick_view_port()))
+        tk.Entry(
+            quick, textvariable=self.quick_port_var, width=7, bg=PANEL_2, fg=FG,
+            insertbackground=FG, relief=tk.FLAT, highlightthickness=0,
+            font=("Consolas", 10),
+        ).pack(side=tk.LEFT, padx=(8, 8), ipady=3)
+        self._mini_button(quick, "Apply", self._restart_quick_view).pack(side=tk.LEFT)
+        self.quick_status = tk.Label(
+            side, text="● not started", bg=PANEL, fg=MUTED, font=(FONT, 9))
+        self.quick_status.pack(anchor="w", pady=(6, 0), **pad)
+
         tk.Frame(side, bg=PANEL_2, height=1).pack(fill=tk.X, pady=(14, 0), **pad)
 
         tk.Label(side, text="VIRTUAL POINTER", bg=PANEL, fg=MUTED, font=(FONT, 9, "bold")).pack(
@@ -594,6 +613,53 @@ class CrDeckInspectorApp:
             path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    def _load_quick_view_port(self) -> int:
+        try:
+            cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+            port = int(cfg.get("quick_view_port", 8766))
+            if 1 <= port <= 65535:
+                return port
+        except Exception:
+            pass
+        return 8766
+
+    def _save_quick_view_port(self, port: int) -> None:
+        try:
+            path = ROOT / "config.json"
+            try:
+                cfg = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                cfg = {}
+            cfg["quick_view_port"] = int(port)
+            path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _restart_quick_view(self) -> None:
+        try:
+            port = int(self.quick_port_var.get().strip())
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            self.quick_status.configure(text="● invalid port", fg=RED)
+            return
+        if self.quick_view is not None and self.quick_view.running:
+            if self.quick_view.port == port:
+                self.quick_status.configure(text="● 0.0.0.0:%d" % port, fg=GREEN)
+                return
+            self.quick_view.stop()
+            self.quick_view = None
+        server = QuickViewServer(port)
+        try:
+            server.start()
+        except OSError as exc:
+            self.quick_status.configure(text="● %s" % exc, fg=RED)
+            return
+        self.quick_view = server
+        self._save_quick_view_port(port)
+        self.quick_status.configure(text="● 0.0.0.0:%d" % port, fg=GREEN)
+        self._append_log("[quick] listening on 0.0.0.0:%d" % port, "resp")
 
     def _set_pointer_flag(self, flag: str, var: tk.BooleanVar) -> None:
         value = "on" if var.get() else "off"
@@ -1157,11 +1223,14 @@ class CrDeckInspectorApp:
             payload = json.loads(body)
             if not payload.get("ok", True):
                 raise RuntimeError(payload.get("error") or "deck lookup failed")
-            deck = payload.get("deck") or []
-            if isinstance(deck, list) and deck and isinstance(deck[0], dict):
-                cards = ", ".join(str(card.get("name", "")) for card in deck)
-            else:
-                cards = str(deck)
+            if self.quick_view is not None:
+                self.quick_view.update(payload)
+            deck = payload.get("deck") or {}
+            raw_cards = deck.get("cards") if isinstance(deck, dict) else deck
+            cards = ", ".join(
+                str(card.get("name", "")) if isinstance(card, dict) else str(card)
+                for card in (raw_cards or [])
+            )
             self._ocr_events.put(("[deck] %s" % (cards or "no deck"), "resp"))
         except Exception as exc:
             self._ocr_events.put(("[deck] %s" % (exc,), "err"))
@@ -1209,6 +1278,8 @@ class CrDeckInspectorApp:
 
     def _on_close(self) -> None:
         self.stop_event.set()
+        if self.quick_view is not None:
+            self.quick_view.stop()
         self._stop_browser()
         self.server.stop()
         self.root.destroy()

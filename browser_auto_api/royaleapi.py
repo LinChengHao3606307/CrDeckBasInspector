@@ -56,7 +56,8 @@ DECKS_JS = """
     seg.querySelectorAll('img.deck_card').forEach(function(img){
       cards.push({
         key: img.getAttribute('data-card-key') || '',
-        name: img.getAttribute('alt') || ''
+        name: img.getAttribute('alt') || '',
+        src: img.getAttribute('src') || img.currentSrc || ''
       });
     });
     if (cards.length || nameEl) {
